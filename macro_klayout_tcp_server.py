@@ -15,6 +15,12 @@ class _JsonTcpServer(object):
         self._port = port
         self._server = pya.QTcpServer()
         self._buffers = {}
+        self._selection_subscribers = set()
+        self._selection_timer = pya.QTimer(self._server)
+        self._selection_timer.setInterval(200)
+        self._selection_timer.timeout.connect(self._on_selection_tick)
+        self._selection_view = None
+        self._last_selection = object()
         self._server.newConnection.connect(self._on_new_connection)
 
     def start(self):
@@ -42,6 +48,10 @@ class _JsonTcpServer(object):
     def _on_disconnected(self, sock):
         if sock in self._buffers:
             del self._buffers[sock]
+        if sock in self._selection_subscribers:
+            self._selection_subscribers.discard(sock)
+            if not self._selection_subscribers:
+                self._selection_timer.stop()
         try:
             sock.deleteLater()
         except Exception:
@@ -76,7 +86,7 @@ class _JsonTcpServer(object):
         method = req.get("method")
         params = req.get("params") or {}
         try:
-            result = self._dispatch(method, params)
+            result = self._dispatch(sock, method, params)
             self._send_ok(sock, req_id, result)
         except Exception as exc:
             self._send_error(sock, req_id, str(exc))
@@ -97,7 +107,67 @@ class _JsonTcpServer(object):
         except Exception:
             pass
 
-    def _dispatch(self, method, params):
+    def _subscribe_selection(self, sock):
+        self._selection_subscribers.add(sock)
+        bound = self._bind_selection_view()
+        if not bound and not self._selection_timer.isActive():
+            self._selection_timer.start()
+        try:
+            selection_str = _get_selected_polygon_string()
+        except Exception:
+            selection_str = None
+        self._last_selection = selection_str
+        return {"subscribed": True, "selection": selection_str}
+
+    def _unsubscribe_selection(self, sock):
+        self._selection_subscribers.discard(sock)
+        if not self._selection_subscribers:
+            self._selection_timer.stop()
+            if self._selection_view is not None:
+                try:
+                    self._selection_view.on_selection_changed = None
+                except Exception:
+                    pass
+                self._selection_view = None
+        return {"subscribed": False}
+
+    def _bind_selection_view(self):
+        try:
+            view = _require_view()
+        except Exception:
+            return False
+        if self._selection_view is view:
+            return True
+        self._selection_view = view
+        try:
+            view.on_selection_changed = lambda v=view: self._notify_selection()
+            return True
+        except Exception:
+            return False
+
+    def _notify_selection(self):
+        if not self._selection_subscribers:
+            return
+        try:
+            selection_str = _get_selected_polygon_string()
+        except Exception:
+            selection_str = None
+        if selection_str == self._last_selection:
+            return
+        self._last_selection = selection_str
+        payload = {"event": "selection", "data": selection_str}
+        for sock in list(self._selection_subscribers):
+            if sock not in self._buffers:
+                self._selection_subscribers.discard(sock)
+                continue
+            self._send(sock, payload)
+
+    def _on_selection_tick(self):
+        if not self._selection_subscribers:
+            return
+        self._notify_selection()
+
+    def _dispatch(self, sock, method, params):
         if method == "ping":
             return {"message": "pong"}
         if method == "shutdown":
@@ -111,6 +181,10 @@ class _JsonTcpServer(object):
             return _get_cell_list(params)
         if method == "export_gds":
             return _export_gds(params)
+        if method == "subscribe_selection":
+            return self._subscribe_selection(sock)
+        if method == "unsubscribe_selection":
+            return self._unsubscribe_selection(sock)
         raise RuntimeError("Unknown method: %s" % method)
 
 
@@ -197,6 +271,54 @@ def _export_gds(params):
     layout = _require_layout()
     layout.write(path)
     return {"exported": True, "path": path}
+
+
+def _selection_string_from_view(view):
+    selection = view.object_selection
+    if not selection:
+        return None
+    cv = view.active_cellview()
+    if cv is None or not cv.is_valid():
+        return None
+    layout = cv.layout()
+    for sel in selection:
+        try:
+            shape = sel.shape
+        except AttributeError:
+            continue
+        if shape is None or shape.is_null():
+            continue
+
+        trans = getattr(sel, "trans", pya.Trans())
+        if callable(trans):
+            trans = trans()
+        if not isinstance(trans, (pya.Trans, pya.ICplxTrans, pya.CplxTrans)):
+            trans = pya.Trans()
+
+        if shape.is_polygon():
+            poly = shape.polygon.transformed(trans)
+        elif shape.is_box():
+            poly = pya.Polygon(shape.box).transformed(trans)
+        else:
+            continue
+        try:
+            layer_index = sel.layer
+        except AttributeError:
+            continue
+        layer_info = layout.get_info(layer_index)
+        layer_str = "%s/%s" % (layer_info.layer, layer_info.datatype)
+
+        coords = []
+        for pt in poly.each_point_hull():
+            coords.append("%s_%s" % (pt.x, pt.y))
+
+        return layer_str + "@" + "_".join(coords)
+    return None
+
+
+def _get_selected_polygon_string():
+    view = _require_view()
+    return _selection_string_from_view(view)
 
 
 SERVER = _JsonTcpServer()
