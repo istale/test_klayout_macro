@@ -9,6 +9,8 @@ from starlette.responses import StreamingResponse
 KLAYOUT_HOST = "127.0.0.1"
 KLAYOUT_PORT = 9009
 KLAYOUT_TOOL_NAME = "klayout"
+LLM_ENDPOINT = "http://127.0.0.1:1234/v1/chat/completions"
+LLM_MODEL = "qwen/qwen3-coder-30b"
 
 
 class AppLogger:
@@ -137,6 +139,7 @@ async def proxy_request(request: Request):
     body_str = body_bytes.decode("utf-8")
     logger.log(f"模型请求：{body_str}")
     body = await request.json()
+    body["model"] = LLM_MODEL
 
     logger.log("模型返回：\n")
 
@@ -145,12 +148,11 @@ async def proxy_request(request: Request):
         async with httpx.AsyncClient(timeout=None) as client:
             async with client.stream(
                 "POST",
-                "https://openrouter.ai/api/v1/chat/completions",
+                LLM_ENDPOINT,
                 json=body,
                 headers={
                     "Content-Type": "application/json",
                     "Accept": "text/event-stream",
-                    "Authorization": request.headers.get("Authorization"),
                 },
             ) as response:
                 async for line in response.aiter_lines():
