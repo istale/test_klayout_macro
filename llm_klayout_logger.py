@@ -1,4 +1,5 @@
 import json
+import os
 import socket
 
 import httpx
@@ -11,7 +12,8 @@ KLAYOUT_PORT = 9009
 KLAYOUT_TOOL_NAME = "klayout"
 LLM_ENDPOINT = "http://127.0.0.1:1234/v1/chat/completions"
 LLM_MODEL = "qwen/qwen3-coder-30b"
-
+LOG_PATH = './llm.log'
+PROXY_PORT = 8001
 
 class AppLogger:
     def __init__(self, log_file="llm.log"):
@@ -108,11 +110,11 @@ def _extract_klayout_commands(buffer_text):
 
 
 def _extract_content_from_event(line):
-    if not line.startswith("data: "):
-        return ""
-    payload = line[6:].strip()
-    if payload == "[DONE]":
-        return ""
+    payload = line.strip()
+    if payload.startswith("data:"):
+        payload = payload[5:].strip()
+        if payload == "[DONE]":
+            return ""
     try:
         data = json.loads(payload)
     except json.JSONDecodeError:
@@ -126,11 +128,29 @@ def _extract_content_from_event(line):
     if content is not None:
         return content
     message = choice.get("message") or {}
-    return message.get("content", "")
+    content = message.get("content")
+    if content is not None:
+        return content
+    tool_calls = delta.get("tool_calls") or message.get("tool_calls") or []
+    if not tool_calls:
+        return ""
+    arguments = []
+    for tool_call in tool_calls:
+        function = tool_call.get("function") or {}
+        name = function.get("name")
+        args = function.get("arguments") or ""
+        if name:
+            trimmed = args.lstrip()
+            if trimmed.startswith("{"):
+                trimmed = trimmed[1:]
+            arguments.append(f'{{"tool":"{name}",{trimmed}')
+        elif args:
+            arguments.append(args)
+    return "".join(arguments)
 
 
 app = FastAPI(title="LLM + KLayout Logger")
-logger = AppLogger("llm.log")
+logger = AppLogger(LOG_PATH)
 
 
 @app.post("/chat/completions")
@@ -173,4 +193,4 @@ async def proxy_request(request: Request):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=PROXY_PORT)
